@@ -1,1 +1,251 @@
+// KQL queries for Incremental updates.
 
+.show table  ingest policy ingestionbatching 
+
+.show database ['EH-RTI-Migration']  policy ingestionbatching
+
+// bronze table load
+
+.create table bronze (timestamp: datetime, device: string, category: string, ['location']: string, 
+productionLine: string, lineUpl: string, ['data']: dynamic)
+
+.create-or-alter function with (docstring = "Defines the transformation from ingest table to bronze table", folder = "UpdatePolicies") 
+UpdatePolicy_Ingest() {
+    ingest
+    | project timestamp, 
+              device=tostring(properties.device), 
+              category=tostring(properties.category),
+              location=tostring(properties.location), 
+              productionLine=tostring(properties.productionLine),
+              lineUpl=tostring(properties.lineUpl), 
+              data
+}
+
+.alter table bronze policy update @'[{"Source": "ingest", "Query": "UpdatePolicy_Ingest()", "IsEnabled": true}]'
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+.create-or-alter function with (docstring = "Transforms bronze table data for IRI measurements into a structured format", folder = "UpdatePolicies")
+ BronzeToIRIMeasurements() {
+    bronze
+    | where device == 'iri' and category == 'measurements'
+    | project utctimestamp=timestamp, 
+              location, 
+              production_line=productionLine, 
+              lineup=lineUpl,
+              id_container=tostring(data.idContainer), 
+              leg=tostring(data.fp), 
+              pocket=tostring(data.pocket),
+              cavity=tostring(data.cavity), 
+              position=tostring(data.position), 
+              measurements=data.measurements
+    | mv-expand kind=array measurements // New line for each inspection_name
+    | extend inspection_name=tostring(measurements[0]), measurements=measurements[1]
+    | mv-expand kind=array measurements // New line for each measurement_name for a given inspection_name
+    | extend measurement_name=tostring(measurements[0]),
+             measurements=bag_remove_keys(measurements[1], dynamic(['probeNames','thresholds'])),
+             probe_names=measurements[1]['probeNames'], 
+             thresholds=measurements[1]['thresholds']
+    | mv-expand kind=array measurements // New line for each measurement_probe
+    | extend probe_number=substring(measurements[0], 6, 1), 
+             value=toreal(measurements[1]) // Extract probe number to pair with label and threshold as well as measurement value
+    | extend probe_label=strcat(probe_number, " ", probe_names[probe_number]), 
+             threshold=thresholds[probe_number]
+    | project-away measurements, probe_names, thresholds, probe_number
+}
+
+.drop table Silver_IRIMeasurements;
+
+.create table Silver_IRIMeasurements (
+    utctimestamp: datetime,
+    location: string,
+    production_line: string,
+    lineup: string,
+    id_container: string,
+    leg: string,
+    pocket: string,
+    cavity: string,
+    position: string,
+    inspection_name: string,
+    measurement_name: string,
+    value: real,
+    probe_label: string,
+    threshold: dynamic
+)
+
+.alter table Silver_IRIMeasurements policy update @'[{"Source": "bronze", "Query": "BronzeToIRIMeasurements()", "IsEnabled": true}]'
+
+
+Silver_IRIMeasurements | take 100
+
+Silver_IRIMeasurements | where ingestion_time() >= ago(5s) | take 10
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+.create-or-alter function with (docstring = "Transforms bronze table data for IRI measurements into a structured format", folder = "UpdatePolicies")
+ BronzeToIRIDefects() {
+    bronze
+    | where device == "iri" and category == "defects"
+    | project utctimestamp = timestamp, 
+          lineupl = lineUpl, 
+          location, 
+          id_container = tostring(data.idContainer), 
+          leg = tostring(data.fp), position = tostring(data.position), 
+          defects = data.defects
+    | mv-expand defects  // Expands defects into separate rows
+    | extend inspection_name = tostring(defects[0]), defects = defects[1]
+    | mv-expand probe = bag_keys(defects) 
+    | extend defect_name = tostring(defects[tostring(probe)]) 
+    | project-away defects
+}
+
+.drop table Silver_IRIDefects;
+
+.create table Silver_IRIDefects (
+    utctimestamp: datetime,
+    lineupl: string,
+    location: string,
+    id_container: string,
+    leg: string,
+    position: string,
+    inspection_name: string,
+    probe: dynamic,
+    defect_name: string
+)
+
+.alter table Silver_IRIDefects policy update @'[{"Source": "bronze", "Query": "BronzeToIRIDefects()", "IsEnabled": true}]'
+
+Silver_IRIDefects | count
+
+Silver_IRIDefects | where ingestion_time() >= ago(5s) | take 10
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+.drop function BronzeToColdsystemMx
+
+.create-or-alter function with (docstring = "Transforms bronze table data for IRI measurements into a structured format", folder = "UpdatePolicies")
+ BronzeToColdsystemMx() {
+    bronze
+    | where device == "coldsystem" and category == "mx"
+    | project utctimestamp=timestamp, location, production_line=productionLine, 
+              lineupl=lineUpl, id_container=tostring(data.ContainerID), 
+              leg=tostring(data.Leg), pocket="", 
+              cavity=tostring(data.MoldNumber), 
+              position=tostring(data.Position), 
+              measurements=data.measurements
+    | mv-expand kind=array measurements // Expand sensor IDs
+    | extend inspection_name=tostring(measurements[0]), measurements=measurements[1].measures
+    | where isnotempty(measurements) // Filter out empty measurements
+    | mv-expand kind=array measurements // Expand measurement names per sensor
+    | extend probe_label = "", threshold=dynamic(null) // Schema alignment
+    | extend measurement_name=tostring(measurements[0]), value=toreal(measurements[1])
+    | project-away measurements
+}
+
+.drop table Silver_TESMeasurements;
+
+.create table Silver_TESMeasurements (
+    utctimestamp: datetime,
+    location: string,
+    production_line: string,
+    lineupl: string,
+    id_container: string,
+    leg: string,
+    pocket: string,
+    cavity: string,
+    position: string,
+    inspection_name: string,
+    probe_label: string,
+    threshold: dynamic,
+    measurement_name: string,
+    value: real
+)
+
+.alter table Silver_TESMeasurements policy update @'[{"Source": "bronze", "Query": "BronzeToColdsystemMx()", "IsEnabled": true}]'
+
+Silver_TESMeasurements | count
+
+Silver_TESMeasurements | where ingestion_time() >= ago(5s) | take 10
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+.create-or-alter function with (docstring = "Transforms bronze table data for IRI measurements into a structured format", folder = "UpdatePolicies")
+ BronzeToBlankWatchTemperature() {
+bronze
+| where device == 'blank-watch' and category == 'temperature'
+| project utctimestamp = timestamp, 
+        location, 
+        production_line = productionLine, 
+        lineupl = lineUpl, 
+        cycle = tostring(data.cycle), 
+        section = tostring(data.section), 
+        gob = tostring(data.gob), 
+        temp_timestamps = parse_json(data.temp_timestamps), 
+        temperatures = parse_json(data.temperatures)
+| mv-expand measurement_name = bag_keys(temperatures)
+| extend 
+    temperature = todouble(temperatures[tostring(measurement_name)]), 
+    utctimestamp_measurement = todatetime(temp_timestamps[tostring(measurement_name)])
+| project-away temp_timestamps, temperatures
+}
+
+.drop table Silver_BlankWatchTemperature;
+
+.create table Silver_BlankWatchTemperature (
+    utctimestamp: datetime,
+    location: string,
+    production_line: string,
+    lineupl: string,
+    cycle: string,
+    section: string,
+    gob: string,
+    measurement_name: dynamic ,
+    temperature: real,
+    utctimestamp_measurement: datetime
+)
+
+.alter table Silver_BlankWatchTemperature policy update @'[{"Source": "bronze", "Query": "BronzeToBlankWatchTemperature()", "IsEnabled": true}]'
+
+Silver_BlankWatchTemperature | count
+
+Silver_BlankWatchTemperature | where ingestion_time() >= ago(5s) | take 10
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+.create-or-alter function with (docstring = "Transforms bronze table data for IRI measurements into a structured format", folder = "UpdatePolicies")
+ BronzeToBlankWatchGobLoading() {
+bronze
+| where device == "blank-watch" and category == "gob-loading"
+| project utctimestamp=timestamp, 
+          location, 
+          production_line=productionLine, 
+          lineupl=lineUpl, 
+          cycle=tostring(data.cycle), 
+          section=tostring(data.section), 
+          gob=tostring(data.gob), 
+          position=tostring(data.position),
+          data=bag_remove_keys(data, dynamic(["position", "cycle", "section", "gob"]))
+| mv-expand kind=array data
+| extend measurement_name=tostring(data[0]), value=toreal(data[1])
+| project-away data 
+}
+
+.create table Silver_BlankWatchGobLoading (
+    utctimestamp: datetime,
+    location: string,
+    production_line: string,
+    lineupl: string,
+    cycle: string,
+    section: string,
+    gob: string,
+    position: string,
+    measurement_name: string,
+    value: real
+)
+
+.alter table Silver_BlankWatchGobLoading policy update @'[{"Source": "bronze", "Query": "BronzeToBlankWatchGobLoading()", "IsEnabled": true}]'
+
+Silver_BlankWatchGobLoading | count
+
+Silver_BlankWatchGobLoading | where ingestion_time() >= ago(5s) | take 10
