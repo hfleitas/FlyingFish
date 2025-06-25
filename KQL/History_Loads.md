@@ -19,7 +19,7 @@ let Queries = Days
          CreationTime = iff(Day == '2025-06-03', format_datetime(EndDate, 'yyyy-MM-dd'), format_datetime(todatetime(strcat(Day, ' 23:59:59.9999999')), 'yyyy-MM-dd'))
 | project Command=strcat(
     ".set-or-append async silver with(creationTime='", CreationTime, "') <| ",
-    "cluster('https://adx-ultra-useast.eastus.kusto.windows.net/').database('cluster('https://adx-ultra-useast.eastus.kusto.windows.net').database('dedb-oiultra').silver ').silver ",
+    "cluster('https://adx-ultra-useast.eastus.kusto.windows.net/').database('dedb-oiultra').silver"
     "| where ingestion_time() between (datetime(", format_datetime(StartTime, 'yyyy-MM-dd HH:mm:ss'), ") .. datetime(", format_datetime(EndTime, 'yyyy-MM-dd HH:mm:ss.fffffff'), "))"
 );
 Queries
